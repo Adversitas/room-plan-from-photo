@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Photos and outputs in the working folder (examples live in examples/)
+/*.jpg
+/*.jpeg
+/*.png
+/*.webp
+/*.heic
+/*.ply
+/*.svg
