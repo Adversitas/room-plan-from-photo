@@ -20,9 +20,11 @@ Notes:
 """
 
 import argparse
+import json
 import time
 from pathlib import Path
 
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -421,7 +423,27 @@ DRAW = {
 }
 
 
-def render(objects, room, out, labels=True, fov=70, view=0.0, camera_note="photo taken here"):
+FREE = "#5BAE6A"
+TAKEN = "#D9534F"
+PARTLY = "#E8A33D"
+
+
+def seat_color(obj):
+    if obj["occupied"] == 0:
+        return FREE
+    return TAKEN if obj["occupied"] >= obj["seats"] else PARTLY
+
+
+def seat_text(obj):
+    if obj["seats"] > 1:
+        return f'{obj["kind"]} {obj["occupied"]}/{obj["seats"]}'
+    return "taken" if obj["occupied"] else "free"
+
+
+def render(objects, room, out, labels=True, fov=70, view=0.0, camera_note="photo taken here", title=None,
+           people=()):
+    """Draw the plan. Objects with "seats"/"occupied" keys get a green/amber/red occupancy tint;
+    `people` are (x, y) plan positions drawn as dots."""
     left, right, near, far = room
     pad = 0.6
     fig_w = 9
@@ -452,9 +474,23 @@ def render(objects, room, out, labels=True, fov=70, view=0.0, camera_note="photo
         else:
             tr = Affine2D().rotate(obj["angle"]).translate(cx, cy) + ax.transData
             DRAW[obj["kind"]](ax, tr, obj["w"], obj["d"])
-        if labels:
-            ax.text(cx, cy, obj["kind"], ha="center", va="center", fontsize=7, color="#3F3933",
+        text = obj["kind"]
+        if "occupied" in obj:
+            color = seat_color(obj)
+            if obj["kind"] in ROUND:
+                ax.add_patch(patches.Circle((cx, cy), obj["w"] / 2 + 0.04, fc=color, ec=color,
+                                            alpha=0.45, lw=1.5, zorder=12))
+            else:
+                rrect(ax, tr, -obj["w"] / 2 - 0.04, -obj["d"] / 2 - 0.04, obj["w"] + 0.08, obj["d"] + 0.08,
+                      0.08, color, ec=color, lw=1.5, z=12, alpha=0.45)
+            text = seat_text(obj)
+        if labels or "occupied" in obj:
+            ax.text(cx, cy, text, ha="center", va="center", fontsize=7, color="#3F3933",
                     zorder=20, path_effects=[patheffects.withStroke(linewidth=2.5, foreground="white")])
+
+    for x, y in people:
+        if left <= x <= right and near <= y <= far:
+            ax.add_patch(patches.Circle((x, y), 0.16, fc="#4A7FD6", ec="white", lw=1.2, alpha=0.9, zorder=15))
 
     # Camera position and view cone
     half = np.radians(fov) / 2
@@ -470,6 +506,10 @@ def render(objects, room, out, labels=True, fov=70, view=0.0, camera_note="photo
     for x in (sx, sx + 1):
         ax.plot([x, x], [sy - 0.06, sy + 0.06], color=WALL, lw=1)
     ax.text(sx + 0.5, sy + 0.1, "1 m", ha="center", va="bottom", fontsize=7, color=WALL)
+
+    if title:
+        ax.text(right, near - pad * 0.55, title, ha="right", va="center", fontsize=10, color=WALL,
+                fontweight="bold")
 
     fig.tight_layout(pad=0.3)
     retry_save(lambda: fig.savefig(out, dpi=200, facecolor="white"))
@@ -593,9 +633,37 @@ def main():
     room = (min(left, -0.8), max(right_x, 0.8), near, far)
 
     out = args.out or args.image.with_name(args.image.stem + "_plan.png")
-    render(placed, room, out, labels=not args.no_labels, fov=args.fov, view=-theta,
-           camera_note="photo taken from above here" if overhead else "photo taken here")
+    camera_note = "photo taken from above here" if overhead else "photo taken here"
+    render(placed, room, out, labels=not args.no_labels, fov=args.fov, view=-theta, camera_note=camera_note)
     print(f"Saved {out}")
+
+    def photo_to_plan(h):
+        """Homography from photo pixels to plan coordinates, for points `h` meters above the floor."""
+        gx, gy = np.meshgrid(np.linspace(0.05, 0.95, 9) * img.width, np.linspace(0.05, 0.95, 9) * img.height)
+        px = np.stack([gx.ravel(), gy.ravel()], axis=1)
+        rays = np.stack([(px[:, 0] - img.width / 2) / f, (px[:, 1] - img.height / 2) / f,
+                         np.ones(len(px))], axis=1)
+        t = (h - d) / (rays @ n)
+        plan = to_floor(px, h) @ rot(-theta).T
+        ok = (t > 0) & (np.hypot(*plan.T) < 30)  # only pixels whose ray actually reaches that plane
+        if ok.sum() < 8:
+            return None
+        H, _ = cv2.findHomography(px[ok].astype(np.float32), plan[ok].astype(np.float32), 0)
+        return None if H is None else H.tolist()
+
+    # Everything occupancy.py needs to reuse this plan with later photos from the same spot.
+    layout_path = args.image.with_name(args.image.stem + "_layout.json")
+    layout = {
+        "image": args.image.name, "size": [img.width, img.height], "overhead": bool(overhead),
+        "fov": args.fov, "view": float(-theta), "camera_note": camera_note,
+        "room": [float(v) for v in room],
+        "floor_to_plan": photo_to_plan(0.0), "seat_to_plan": photo_to_plan(0.45),
+        "objects": [{"kind": p["kind"], "box": [float(v) for v in p["box"]],
+                     "center": [float(v) for v in p["center"]], "angle": float(p["angle"]),
+                     "w": float(p["w"]), "d": float(p["d"])} for p in placed],
+    }
+    layout_path.write_text(json.dumps(layout, indent=1))
+    print(f"Saved {layout_path}")
     if args.debug:
         dbg = args.image.with_name(args.image.stem + "_detections.png")
         save_debug(img, objects, dbg)

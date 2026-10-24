@@ -3,3 +3,4 @@ transformers>=4.45
 pillow
 numpy
 matplotlib
+opencv-python-headless
